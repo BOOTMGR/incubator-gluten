@@ -24,13 +24,14 @@ import org.apache.gluten.sql.shims.SparkShimLoader
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.execution.SparkPlan
+import org.apache.spark.sql.execution.SparkPlanShim
 
 case class BloomFilterMightContainJointRewriteRule(spark: SparkSession) extends Rule[SparkPlan] {
   override def apply(plan: SparkPlan): SparkPlan = {
     if (!GlutenConfig.get.enableNativeBloomFilter) {
       return plan
     }
-    val out = plan.transformWithSubqueries {
+    val out = SparkPlanShim(plan).transformWithSubqueries {
       case p =>
         applyForNode(p)
     }
