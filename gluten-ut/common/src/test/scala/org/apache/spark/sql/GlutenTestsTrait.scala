@@ -20,7 +20,7 @@ import org.apache.gluten.backendsapi.BackendsApiManager
 import org.apache.gluten.config.GlutenConfig
 import org.apache.gluten.execution.ProjectExecTransformer
 import org.apache.gluten.test.TestStats
-import org.apache.gluten.utils.{BackendTestUtils, SystemParameters}
+import org.apache.gluten.utils.BackendTestUtils
 
 import org.apache.spark.sql.GlutenQueryTestUtil.isNaNOrInf
 import org.apache.spark.sql.catalyst.{CatalystTypeConverters, InternalRow}
@@ -106,6 +106,7 @@ trait GlutenTestsTrait extends GlutenTestsCommonTrait {
         .config("spark.sql.warehouse.dir", warehouse)
         // Avoid the code size overflow error in Spark code generation.
         .config("spark.sql.codegen.wholeStage", "false")
+        .config("spark.ui.enabled", "false")
 
       _spark = if (BackendTestUtils.isCHBackendLoaded()) {
         sparkBuilder
@@ -113,7 +114,6 @@ trait GlutenTestsTrait extends GlutenTestsCommonTrait {
           .config("spark.gluten.sql.columnar.backend.ch.worker.id", "1")
           .config("spark.gluten.sql.enable.native.validation", "false")
           .config("spark.sql.files.openCostInBytes", "134217728")
-          .config(GlutenConfig.GLUTEN_LIB_PATH, SystemParameters.getClickHouseLibPath)
           .config("spark.unsafe.exceptionOnMemoryLeak", "true")
           .config(GlutenConfig.UT_STATISTIC.key, "true")
           .getOrCreate()

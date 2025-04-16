@@ -15,13 +15,13 @@
  * limitations under the License.
  */
 
-#include "VeloxShuffleReader.h"
-#include "GlutenByteStream.h"
+#include "shuffle/VeloxShuffleReader.h"
 
 #include <arrow/array/array_binary.h>
 #include <arrow/io/buffered.h>
 
 #include "memory/VeloxColumnarBatch.h"
+#include "shuffle/GlutenByteStream.h"
 #include "shuffle/Payload.h"
 #include "shuffle/Utils.h"
 #include "utils/Common.h"
@@ -440,7 +440,7 @@ std::shared_ptr<ColumnarBatch> VeloxSortShuffleReaderDeserializer::deserializeTo
     auto buffer = cur->second;
     const auto* rawBuffer = buffer->as<char>();
     while (rowOffset_ < cur->first && readRows < batchSize_) {
-      auto rowSize = *(RowSizeType*)(rawBuffer + byteOffset_) - sizeof(RowSizeType);
+      auto rowSize = *(reinterpret_cast<const RowSizeType*>(rawBuffer + byteOffset_)) - sizeof(RowSizeType);
       byteOffset_ += sizeof(RowSizeType);
       data.push_back(std::string_view(rawBuffer + byteOffset_, rowSize));
       byteOffset_ += rowSize;
@@ -501,6 +501,8 @@ class VeloxRssSortShuffleReaderDeserializer::VeloxInputStream : public facebook:
 
   void next(bool throwIfPastEnd) override;
 
+  size_t remainingSize() const override;
+
   std::shared_ptr<arrow::io::InputStream> in_;
   const facebook::velox::BufferPtr buffer_;
   uint64_t offset_ = -1;
@@ -546,14 +548,18 @@ VeloxRssSortShuffleReaderDeserializer::VeloxRssSortShuffleReaderDeserializer(
       batchSize_(batchSize),
       veloxCompressionType_(veloxCompressionType),
       serde_(getNamedVectorSerde(facebook::velox::VectorSerde::Kind::kPresto)),
-      deserializeTime_(deserializeTime) {
-  constexpr uint64_t kMaxReadBufferSize = (1 << 20) - AlignedBuffer::kPaddedSize;
-  auto buffer = AlignedBuffer::allocate<char>(kMaxReadBufferSize, veloxPool_.get());
-  in_ = std::make_unique<VeloxInputStream>(std::move(in), std::move(buffer));
+      deserializeTime_(deserializeTime),
+      arrowIn_(in) {
   serdeOptions_ = {false, veloxCompressionType_};
 }
 
 std::shared_ptr<ColumnarBatch> VeloxRssSortShuffleReaderDeserializer::next() {
+  if (in_ == nullptr) {
+    constexpr uint64_t kMaxReadBufferSize = (1 << 20) - AlignedBuffer::kPaddedSize;
+    auto buffer = AlignedBuffer::allocate<char>(kMaxReadBufferSize, veloxPool_.get());
+    in_ = std::make_unique<VeloxInputStream>(std::move(arrowIn_), std::move(buffer));
+  }
+
   if (!in_->hasNext()) {
     return nullptr;
   }
@@ -576,7 +582,11 @@ std::shared_ptr<ColumnarBatch> VeloxRssSortShuffleReaderDeserializer::next() {
   return std::make_shared<VeloxColumnarBatch>(std::move(rowVector));
 }
 
-VeloxColumnarBatchDeserializerFactory::VeloxColumnarBatchDeserializerFactory(
+size_t VeloxRssSortShuffleReaderDeserializer::VeloxInputStream::remainingSize() const {
+  return std::numeric_limits<unsigned long>::max();
+}
+
+VeloxShuffleReaderDeserializerFactory::VeloxShuffleReaderDeserializerFactory(
     const std::shared_ptr<arrow::Schema>& schema,
     const std::shared_ptr<arrow::util::Codec>& codec,
     const facebook::velox::common::CompressionKind veloxCompressionType,
@@ -598,7 +608,7 @@ VeloxColumnarBatchDeserializerFactory::VeloxColumnarBatchDeserializerFactory(
   initFromSchema();
 }
 
-std::unique_ptr<ColumnarBatchIterator> VeloxColumnarBatchDeserializerFactory::createDeserializer(
+std::unique_ptr<ColumnarBatchIterator> VeloxShuffleReaderDeserializerFactory::createDeserializer(
     std::shared_ptr<arrow::io::InputStream> in) {
   switch (shuffleWriterType_) {
     case ShuffleWriterType::kHashShuffle:
@@ -635,23 +645,19 @@ std::unique_ptr<ColumnarBatchIterator> VeloxColumnarBatchDeserializerFactory::cr
   }
 }
 
-arrow::MemoryPool* VeloxColumnarBatchDeserializerFactory::getPool() {
+arrow::MemoryPool* VeloxShuffleReaderDeserializerFactory::getPool() {
   return memoryPool_;
 }
 
-ShuffleWriterType VeloxColumnarBatchDeserializerFactory::getShuffleWriterType() {
-  return shuffleWriterType_;
-}
-
-int64_t VeloxColumnarBatchDeserializerFactory::getDecompressTime() {
+int64_t VeloxShuffleReaderDeserializerFactory::getDecompressTime() {
   return decompressTime_;
 }
 
-int64_t VeloxColumnarBatchDeserializerFactory::getDeserializeTime() {
+int64_t VeloxShuffleReaderDeserializerFactory::getDeserializeTime() {
   return deserializeTime_;
 }
 
-void VeloxColumnarBatchDeserializerFactory::initFromSchema() {
+void VeloxShuffleReaderDeserializerFactory::initFromSchema() {
   GLUTEN_ASSIGN_OR_THROW(auto arrowColumnTypes, toShuffleTypeId(schema_->fields()));
   isValidityBuffer_.reserve(arrowColumnTypes.size());
   for (size_t i = 0; i < arrowColumnTypes.size(); ++i) {
@@ -681,7 +687,23 @@ void VeloxColumnarBatchDeserializerFactory::initFromSchema() {
   }
 }
 
-VeloxShuffleReader::VeloxShuffleReader(std::unique_ptr<DeserializerFactory> factory)
-    : ShuffleReader(std::move(factory)) {}
+VeloxShuffleReader::VeloxShuffleReader(std::unique_ptr<VeloxShuffleReaderDeserializerFactory> factory)
+    : factory_(std::move(factory)) {}
+
+std::shared_ptr<ResultIterator> VeloxShuffleReader::readStream(std::shared_ptr<arrow::io::InputStream> in) {
+  return std::make_shared<ResultIterator>(factory_->createDeserializer(in));
+}
+
+arrow::MemoryPool* VeloxShuffleReader::getPool() const {
+  return factory_->getPool();
+}
+
+int64_t VeloxShuffleReader::getDecompressTime() const {
+  return factory_->getDecompressTime();
+}
+
+int64_t VeloxShuffleReader::getDeserializeTime() const {
+  return factory_->getDeserializeTime();
+}
 
 } // namespace gluten

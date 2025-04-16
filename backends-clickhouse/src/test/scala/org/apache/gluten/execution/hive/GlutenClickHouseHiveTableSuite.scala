@@ -16,10 +16,8 @@
  */
 package org.apache.gluten.execution.hive
 
-import org.apache.gluten.config.GlutenConfig
 import org.apache.gluten.execution.{FileSourceScanExecTransformer, GlutenClickHouseWholeStageTransformerSuite, ProjectExecTransformer, TransformSupport}
 import org.apache.gluten.test.AllDataTypesWithComplexType
-import org.apache.gluten.utils.UTSystemParameters
 
 import org.apache.spark.SparkConf
 import org.apache.spark.sql.{DataFrame, SaveMode}
@@ -42,7 +40,7 @@ class GlutenClickHouseHiveTableSuite
   with AdaptiveSparkPlanHelper {
 
   override protected def sparkConf: SparkConf = {
-    import org.apache.gluten.backendsapi.clickhouse.CHConf._
+    import org.apache.gluten.backendsapi.clickhouse.CHConfig._
 
     new SparkConf()
       .set("spark.plugins", "org.apache.gluten.GlutenPlugin")
@@ -55,9 +53,7 @@ class GlutenClickHouseHiveTableSuite
       .set("spark.sql.shuffle.partitions", "5")
       .set("spark.sql.adaptive.enabled", "false")
       .set("spark.sql.files.minPartitionNum", "1")
-      .set("spark.gluten.sql.columnar.columnartorow", "true")
       .set(ClickHouseConfig.CLICKHOUSE_WORKER_ID, "1")
-      .set(GlutenConfig.GLUTEN_LIB_PATH, UTSystemParameters.clickHouseLibPath)
       .set("spark.gluten.sql.columnar.iterator", "true")
       .set("spark.gluten.sql.columnar.hashagg.enablefinal", "true")
       .set("spark.gluten.sql.enable.native.validation", "false")
@@ -1645,6 +1641,64 @@ class GlutenClickHouseHiveTableSuite
         )
       }
       spark.sql("drop table if exists %s".format(table_name))
+    }
+  }
+
+  test("test input_file_name() in different formats") {
+    val formats = Seq("textfile", "orc", "parquet")
+    val tableNamePrefix = "sales_"
+
+    formats.foreach {
+      format =>
+        val tableName = s"$tableNamePrefix${format.take(2)}"
+        val createTableSql =
+          s"""
+             |CREATE TABLE $tableName (
+             |  product_id STRING,
+             |  quantity INT
+             |) PARTITIONED BY (year STRING)
+             |STORED AS $format
+             |""".stripMargin
+
+        val insertDataSql1 =
+          s"""
+             |INSERT INTO $tableName PARTITION(year='2001')
+             |SELECT 'prod1', 100
+             |""".stripMargin
+
+        val insertDataSql2 =
+          s"""
+             |INSERT INTO $tableName PARTITION(year='2002')
+             |SELECT 'prod1', 200
+             |""".stripMargin
+
+        val select1Sql = s"SELECT input_file_name() from $tableName"
+        val select2Sql = s"SELECT input_file_block_start(), " +
+          s"input_file_block_length() FROM $tableName"
+        s"input_file_block_length() FROM $tableName"
+        val dropSql = s"DROP TABLE IF EXISTS $tableName"
+
+        spark.sql(createTableSql)
+        spark.sql(insertDataSql1)
+        spark.sql(insertDataSql2)
+
+        if (format.equals("textfile")) {
+          // When format is textfile, input_file_name() in vanilla returns paths like 'file:/xxx'
+          // But in gluten it returns paths like 'file:///xxx'.
+          val result = spark.sql(select1Sql)
+          result
+            .collect()
+            .foreach(
+              row => {
+                assert(!row.isNullAt(0) && row.getString(0).nonEmpty)
+              })
+        } else {
+          compareResultsAgainstVanillaSpark(select1Sql, compareResult = true, _ => {})
+        }
+
+        compareResultsAgainstVanillaSpark(select2Sql, compareResult = true, _ => {})
+
+        spark.sql(dropSql)
     }
   }
 

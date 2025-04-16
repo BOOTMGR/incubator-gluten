@@ -50,7 +50,8 @@ abstract class HashAggregateExecTransformer(
     aggregateAttributes: Seq[Attribute],
     initialInputBufferOffset: Int,
     resultExpressions: Seq[NamedExpression],
-    child: SparkPlan)
+    child: SparkPlan,
+    ignoreNullKeys: Boolean)
   extends HashAggregateExecBaseTransformer(
     requiredChildDistributionExpressions,
     groupingExpressions,
@@ -58,7 +59,9 @@ abstract class HashAggregateExecTransformer(
     aggregateAttributes,
     initialInputBufferOffset,
     resultExpressions,
-    child) {
+    child,
+    ignoreNullKeys
+  ) {
 
   override def output: Seq[Attribute] = {
     // TODO: We should have a check to make sure the returned schema actually matches the output
@@ -119,7 +122,7 @@ abstract class HashAggregateExecTransformer(
    * @return
    *   a project rel
    */
-  def applyExtractStruct(
+  private def applyExtractStruct(
       context: SubstraitContext,
       aggRel: RelNode,
       operatorId: Long,
@@ -192,7 +195,8 @@ abstract class HashAggregateExecTransformer(
   private def formatExtOptimizationString(isStreaming: Boolean): String = {
     val isStreamingStr = if (isStreaming) "1" else "0"
     val allowFlushStr = if (allowFlush) "1" else "0"
-    s"isStreaming=$isStreamingStr\nallowFlush=$allowFlushStr\n"
+    val ignoreNullKeysStr = if (ignoreNullKeys) "1" else "0"
+    s"isStreaming=$isStreamingStr\nallowFlush=$allowFlushStr\nignoreNullKeys=$ignoreNullKeysStr\n"
   }
 
   // Create aggregate function node and add to list.
@@ -260,7 +264,7 @@ abstract class HashAggregateExecTransformer(
    * Return the output types after partial aggregation through Velox.
    * @return
    */
-  def getPartialAggOutTypes: JList[TypeNode] = {
+  private def getPartialAggOutTypes: JList[TypeNode] = {
     val typeNodeList = new JArrayList[TypeNode]()
     groupingExpressions.foreach(
       expression => {
@@ -419,25 +423,13 @@ abstract class HashAggregateExecTransformer(
     }
 
     // Create a project rel.
-    val emitStartIndex = originalInputAttributes.size
-    val projectRel = if (!validation) {
-      RelBuilder.makeProjectRel(inputRel, exprNodes, context, operatorId, emitStartIndex)
-    } else {
-      // Use a extension node to send the input types through Substrait plan for validation.
-      val inputTypeNodeList = originalInputAttributes
-        .map(attr => ConverterUtils.getTypeNode(attr.dataType, attr.nullable))
-        .asJava
-      val extensionNode = ExtensionBuilder.makeAdvancedExtension(
-        BackendsApiManager.getTransformerApiInstance.packPBMessage(
-          TypeBuilder.makeStruct(false, inputTypeNodeList).toProtobuf))
-      RelBuilder.makeProjectRel(
-        inputRel,
-        exprNodes,
-        extensionNode,
-        context,
-        operatorId,
-        emitStartIndex)
-    }
+    val projectRel = RelBuilder.makeProjectRel(
+      originalInputAttributes.asJava,
+      inputRel,
+      exprNodes,
+      context,
+      operatorId,
+      validation)
 
     // Create aggregation rel.
     val groupingList = new JArrayList[ExpressionNode]()
@@ -669,13 +661,13 @@ abstract class HashAggregateExecTransformer(
 object VeloxAggregateFunctionsBuilder {
 
   /**
-   * Create an scalar function for the input aggregate function.
+   * Create a scalar function for the input aggregate function.
    * @param args:
    *   the function map.
    * @param aggregateFunc:
    *   the input aggregate function.
-   * @param forMergeCompanion:
-   *   whether this is a special case to solve mixed aggregation phases.
+   * @param mode:
+   *   the mode of input aggregate function.
    * @return
    */
   def create(
@@ -717,7 +709,8 @@ case class RegularHashAggregateExecTransformer(
     aggregateAttributes: Seq[Attribute],
     initialInputBufferOffset: Int,
     resultExpressions: Seq[NamedExpression],
-    child: SparkPlan)
+    child: SparkPlan,
+    ignoreNullKeys: Boolean = false)
   extends HashAggregateExecTransformer(
     requiredChildDistributionExpressions,
     groupingExpressions,
@@ -725,7 +718,9 @@ case class RegularHashAggregateExecTransformer(
     aggregateAttributes,
     initialInputBufferOffset,
     resultExpressions,
-    child) {
+    child,
+    ignoreNullKeys
+  ) {
 
   override protected def allowFlush: Boolean = false
 
@@ -749,7 +744,8 @@ case class FlushableHashAggregateExecTransformer(
     aggregateAttributes: Seq[Attribute],
     initialInputBufferOffset: Int,
     resultExpressions: Seq[NamedExpression],
-    child: SparkPlan)
+    child: SparkPlan,
+    ignoreNullKeys: Boolean = false)
   extends HashAggregateExecTransformer(
     requiredChildDistributionExpressions,
     groupingExpressions,
@@ -757,7 +753,9 @@ case class FlushableHashAggregateExecTransformer(
     aggregateAttributes,
     initialInputBufferOffset,
     resultExpressions,
-    child) {
+    child,
+    ignoreNullKeys
+  ) {
 
   override protected def allowFlush: Boolean = true
 

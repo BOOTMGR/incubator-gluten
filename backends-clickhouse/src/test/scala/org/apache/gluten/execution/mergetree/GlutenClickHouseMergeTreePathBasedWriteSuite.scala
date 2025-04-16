@@ -16,7 +16,7 @@
  */
 package org.apache.gluten.execution.mergetree
 
-import org.apache.gluten.backendsapi.clickhouse.{CHConf, RuntimeSettings}
+import org.apache.gluten.backendsapi.clickhouse.{CHConfig, RuntimeSettings}
 import org.apache.gluten.config.GlutenConfig
 import org.apache.gluten.execution._
 import org.apache.gluten.utils.Arm
@@ -50,7 +50,7 @@ class GlutenClickHouseMergeTreePathBasedWriteSuite
 
   /** Run Gluten + ClickHouse Backend with SortShuffleManager */
   override protected def sparkConf: SparkConf = {
-    import org.apache.gluten.backendsapi.clickhouse.CHConf._
+    import org.apache.gluten.backendsapi.clickhouse.CHConfig._
 
     super.sparkConf
       .set("spark.shuffle.manager", "org.apache.spark.shuffle.sort.ColumnarShuffleManager")
@@ -61,7 +61,7 @@ class GlutenClickHouseMergeTreePathBasedWriteSuite
       .set("spark.sql.files.maxPartitionBytes", "20000000")
       .set("spark.ui.enabled", "true")
       .set(GlutenConfig.NATIVE_WRITER_ENABLED.key, "true")
-      .set(CHConf.ENABLE_ONEPIPELINE_MERGETREE_WRITE.key, spark35.toString)
+      .set(CHConfig.ENABLE_ONEPIPELINE_MERGETREE_WRITE.key, spark35.toString)
       .set(RuntimeSettings.MIN_INSERT_BLOCK_SIZE_ROWS.key, "100000")
       .setCHSettings("mergetree.merge_after_insert", false)
       .setCHSettings("input_format_parquet_max_block_size", 8192)
@@ -351,13 +351,13 @@ class GlutenClickHouseMergeTreePathBasedWriteSuite
         assert(ClickHouseTableV2.getTable(fileIndex.deltaLog).partitionColumns.isEmpty)
         val addFiles = fileIndex.matchingFiles(Nil, Nil).map(f => f.asInstanceOf[AddMergeTreeParts])
         assertResult(600572)(addFiles.map(_.rows).sum)
-        // 4 parts belong to the first batch
-        // 2 parts belong to the second batch (1 actual updated part, 1 passively updated).
+        // 5 parts belong to the first batch
+        // 1 parts belong to the second batch (1 actual updated part).
         assertResult(6)(addFiles.size)
         val filePaths =
           addFiles.map(_.path).groupBy(name => name.substring(0, name.lastIndexOf("_")))
         assertResult(2)(filePaths.size)
-        assertResult(Array(2, 4))(filePaths.values.map(paths => paths.size).toArray.sorted)
+        assertResult(Array(1, 5))(filePaths.values.map(paths => paths.size).toArray.sorted)
       }
 
       val clickhouseTable = ClickhouseTable.forPath(spark, dataPath)
@@ -428,12 +428,12 @@ class GlutenClickHouseMergeTreePathBasedWriteSuite
       val mergetreeScan = scanExec.head
       val fileIndex = mergetreeScan.relation.location.asInstanceOf[TahoeFileIndex]
       val addFiles = fileIndex.matchingFiles(Nil, Nil).map(f => f.asInstanceOf[AddMergeTreeParts])
-      // 4 parts belong to the first batch
-      // 2 parts belong to the second batch (1 actual updated part, 1 passively updated).
+      // 5 parts belong to the first batch
+      // 1 parts belong to the second batch (1 actual updated part).
       assertResult(6)(addFiles.size)
       val filePaths = addFiles.map(_.path).groupBy(name => name.substring(0, name.lastIndexOf("_")))
       assertResult(2)(filePaths.size)
-      assertResult(Array(2, 4))(filePaths.values.map(paths => paths.size).toArray.sorted)
+      assertResult(Array(1, 5))(filePaths.values.map(paths => paths.size).toArray.sorted)
 
       val clickhouseTable = ClickhouseTable.forPath(spark, dataPath)
       clickhouseTable.delete("mod(l_orderkey, 3) = 2")

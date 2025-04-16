@@ -17,12 +17,13 @@
 #pragma once
 #include <config.h>
 #if USE_ROCKSDB
+#include <shared_mutex>
+#include <Core/BackgroundSchedulePool.h>
 #include <Disks/DiskLocal.h>
 #include <Disks/ObjectStorages/DiskObjectStorageMetadata.h>
 #include <Disks/ObjectStorages/IMetadataStorage.h>
 #include <Disks/ObjectStorages/MetadataOperationsHolder.h>
 #include <rocksdb/db.h>
-#include <shared_mutex>
 
 namespace local_engine
 {
@@ -47,6 +48,7 @@ public:
     Poco::Timestamp getLastModified(const std::string & path) const override;
     bool supportsChmod() const override;
     bool supportsStat() const override;
+    bool supportsPartitionCommand(const DB::PartitionCommand & command) const override;
     std::vector<std::string> listDirectory(const std::string & path) const override;
     DB::DirectoryIteratorPtr iterateDirectory(const std::string & path) const override;
     uint32_t getHardlinkCount(const std::string & path) const override;

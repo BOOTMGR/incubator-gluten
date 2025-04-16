@@ -24,6 +24,7 @@ import org.apache.spark.SparkConf
 import org.apache.spark.sql.{AnalysisException, DataFrame, Row}
 import org.apache.spark.sql.execution._
 import org.apache.spark.sql.execution.adaptive.AdaptiveSparkPlanHelper
+import org.apache.spark.sql.execution.joins.BroadcastNestedLoopJoinExec
 import org.apache.spark.sql.execution.window.WindowExec
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.internal.SQLConf
@@ -34,7 +35,6 @@ import java.util.concurrent.TimeUnit
 import scala.collection.JavaConverters
 
 class MiscOperatorSuite extends VeloxWholeStageTransformerSuite with AdaptiveSparkPlanHelper {
-
   protected val rootPath: String = getClass.getResource("/").getPath
   override protected val resourcePath: String = "/tpch-data-parquet"
   override protected val fileFormat: String = "parquet"
@@ -312,7 +312,7 @@ class MiscOperatorSuite extends VeloxWholeStageTransformerSuite with AdaptiveSpa
     checkLengthAndPlan(df, 5)
   }
 
-  testWithSpecifiedSparkVersion("coalesce validation", Some("3.4")) {
+  testWithMinSparkVersion("coalesce validation", "3.4") {
     withTempPath {
       path =>
         val data = "2019-09-09 01:02:03.456789"
@@ -1971,17 +1971,72 @@ class MiscOperatorSuite extends VeloxWholeStageTransformerSuite with AdaptiveSpa
   }
 
   test("test 'spark.gluten.enabled'") {
-    withSQLConf(GlutenConfig.GLUTEN_ENABLED_KEY -> "true") {
+    withSQLConf(GlutenConfig.GLUTEN_ENABLED.key -> "true") {
       runQueryAndCompare("select * from lineitem limit 1") {
         checkGlutenOperatorMatch[FileSourceScanExecTransformer]
       }
-      withSQLConf(GlutenConfig.GLUTEN_ENABLED_KEY -> "false") {
+      withSQLConf(GlutenConfig.GLUTEN_ENABLED.key -> "false") {
         runQueryAndCompare("select * from lineitem limit 1") {
           checkSparkOperatorMatch[FileSourceScanExec]
         }
       }
       runQueryAndCompare("select * from lineitem limit 1") {
         checkGlutenOperatorMatch[FileSourceScanExecTransformer]
+      }
+    }
+  }
+
+  test("support null type in aggregate") {
+    runQueryAndCompare("SELECT max(null), min(null) from range(10)".stripMargin) {
+      checkGlutenOperatorMatch[HashAggregateExecTransformer]
+    }
+  }
+
+  test("FullOuter in BroadcastNestLoopJoin") {
+    withTable("t1", "t2") {
+      spark.range(10).write.format("parquet").saveAsTable("t1")
+      spark.range(10).write.format("parquet").saveAsTable("t2")
+
+      // with join condition should fallback.
+      withSQLConf("spark.sql.autoBroadcastJoinThreshold" -> "1MB") {
+        runQueryAndCompare("SELECT * FROM t1 FULL OUTER JOIN t2 ON t1.id < t2.id") {
+          checkSparkOperatorMatch[BroadcastNestedLoopJoinExec]
+        }
+
+        // without join condition should offload to gluten operator.
+        runQueryAndCompare("SELECT * FROM t1 FULL OUTER JOIN t2") {
+          checkGlutenOperatorMatch[BroadcastNestedLoopJoinExecTransformer]
+        }
+      }
+    }
+  }
+
+  test("test get_struct_field with scalar function as input") {
+    withSQLConf("spark.sql.json.enablePartialResults" -> "true") {
+      withTable("t") {
+        withTempPath {
+          path =>
+            Seq[String](
+              "{\"a\":1,\"b\":[10, 11, 12]}",
+              "{\"a\":2,\"b\":[20, 21, 22]}"
+            ).toDF("json_str").write.parquet(path.getCanonicalPath)
+            spark.read.parquet(path.getCanonicalPath).createOrReplaceTempView("t")
+
+            val query =
+              """
+                | select
+                |  from_json(json_str, 'a INT, b ARRAY<INT>').a,
+                |  from_json(json_str, 'a INT, b ARRAY<INT>').b
+                | from t
+                |""".stripMargin
+
+            runQueryAndCompare(query)(
+              df => {
+                val executedPlan = getExecutedPlan(df)
+                assert(executedPlan.count(_.isInstanceOf[ProjectExec]) == 0)
+                assert(executedPlan.count(_.isInstanceOf[ProjectExecTransformer]) == 1)
+              })
+        }
       }
     }
   }

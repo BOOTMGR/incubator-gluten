@@ -16,8 +16,9 @@
  */
 #include "SparkMergeTreeWriter.h"
 
-#include <Core/Settings.h>
 #include <Interpreters/ActionsDAG.h>
+#include <Interpreters/ExpressionActions.h>
+#include <QueryPipeline/Chain.h>
 #include <Storages/MergeTree/DataPartStorageOnDiskFull.h>
 #include <Storages/MergeTree/MetaDataHelper.h>
 #include <Storages/MergeTree/SparkMergeTreeSink.h>
@@ -127,7 +128,7 @@ SparkMergeTreeWriter::SparkMergeTreeWriter(
 {
 }
 
-void SparkMergeTreeWriter::write(DB::Block & block)
+void SparkMergeTreeWriter::write(const DB::Block & block)
 {
     auto new_block = removeColumnSuffix(block);
     auto converter = ActionsDAG::makeConvertingActions(

@@ -17,7 +17,7 @@
 package org.apache.gluten.backendsapi.velox
 
 import org.apache.gluten.backendsapi.SparkPlanExecApi
-import org.apache.gluten.config.GlutenConfig
+import org.apache.gluten.config.{GlutenConfig, ReservedKeys, VeloxConfig}
 import org.apache.gluten.exception.GlutenNotSupportException
 import org.apache.gluten.execution._
 import org.apache.gluten.expression._
@@ -57,6 +57,8 @@ import org.apache.spark.task.TaskResources
 import org.apache.commons.lang3.ClassUtils
 
 import javax.ws.rs.core.UriBuilder
+
+import java.util.Locale
 
 class VeloxSparkPlanExecApi extends SparkPlanExecApi {
 
@@ -292,6 +294,19 @@ class VeloxSparkPlanExecApi extends SparkPlanExecApi {
     GenericExpressionTransformer(newSubstraitName, children, newExpr)
   }
 
+  override def genArrayInsertTransformer(
+      substraitExprName: String,
+      children: Seq[ExpressionTransformer],
+      original: Expression): ExpressionTransformer = {
+    children match {
+      case Seq(left, posExpr, right, _) if posExpr.original == Literal(1) =>
+        // Transformer for array_prepend.
+        GenericExpressionTransformer(ExpressionNames.ARRAY_PREPEND, Seq(left, right), original)
+      case _ =>
+        GenericExpressionTransformer(substraitExprName, children, original)
+    }
+  }
+
   /**
    * Generate FilterExecTransformer.
    *
@@ -347,8 +362,8 @@ class VeloxSparkPlanExecApi extends SparkPlanExecApi {
       plan match {
         case shuffle: ColumnarShuffleExchangeExec
             if !shuffle.useSortBasedShuffle &&
-              GlutenConfig.get.veloxResizeBatchesShuffleInput =>
-          val range = GlutenConfig.get.veloxResizeBatchesShuffleInputRange
+              VeloxConfig.get.veloxResizeBatchesShuffleInput =>
+          val range = VeloxConfig.get.veloxResizeBatchesShuffleInputRange
           val appendBatches =
             VeloxResizeBatchesExec(shuffle.child, range.min, range.max)
           shuffle.withNewChildren(Seq(appendBatches))
@@ -545,7 +560,7 @@ class VeloxSparkPlanExecApi extends SparkPlanExecApi {
   override def useSortBasedShuffle(partitioning: Partitioning, output: Seq[Attribute]): Boolean = {
     val conf = GlutenConfig.get
     lazy val isCelebornSortBasedShuffle = conf.isUseCelebornShuffleManager &&
-      conf.celebornShuffleWriterType == GlutenConfig.GLUTEN_SORT_SHUFFLE_WRITER
+      conf.celebornShuffleWriterType == ReservedKeys.GLUTEN_SORT_SHUFFLE_WRITER
     partitioning != SinglePartition &&
     (partitioning.numPartitions >= GlutenConfig.get.columnarShuffleSortPartitionsThreshold ||
       output.size >= GlutenConfig.get.columnarShuffleSortColumnsThreshold) ||
@@ -624,7 +639,7 @@ class VeloxSparkPlanExecApi extends SparkPlanExecApi {
       numOutputRows: SQLMetric,
       dataSize: SQLMetric): BuildSideRelation = {
     val useOffheapBroadcastBuildRelation =
-      GlutenConfig.get.enableBroadcastBuildRelationInOffheap
+      VeloxConfig.get.enableBroadcastBuildRelationInOffheap
     val serialized: Array[ColumnarBatchSerializeResult] = child
       .executeColumnar()
       .mapPartitions(itr => Iterator(BroadcastUtils.serializeStream(itr)))
@@ -700,6 +715,64 @@ class VeloxSparkPlanExecApi extends SparkPlanExecApi {
     GenericExpressionTransformer(substraitExprName, children, expr)
   }
 
+  /** Generate an expression transformer to transform JsonToStructs to Substrait. */
+  override def genFromJsonTransformer(
+      substraitExprName: String,
+      children: Seq[ExpressionTransformer],
+      expr: JsonToStructs): ExpressionTransformer = {
+    val enablePartialResults =
+      try {
+        SQLConf.get.getConfString(s"spark.sql.json.enablePartialResults").toBoolean
+      } catch {
+        case _: NoSuchElementException =>
+          // Before spark 3.4, this config is not defined, and partial result parsing is not
+          // supported. Therefore we need to return false.
+          false
+      }
+    if (!enablePartialResults) {
+      // Velox only supports partial results mode. We need to fall back this when
+      // 'spark.sql.json.enablePartialResults' is set to false or not defined.
+      throw new GlutenNotSupportException(
+        s"'from_json' with 'spark.sql.json.enablePartialResults = false' is not supported in Velox")
+    }
+    if (!expr.options.isEmpty) {
+      throw new GlutenNotSupportException("'from_json' with options is not supported in Velox")
+    }
+    if (SQLConf.get.caseSensitiveAnalysis) {
+      throw new GlutenNotSupportException(
+        "'from_json' with 'spark.sql.caseSensitive = true' is not supported in Velox")
+    }
+
+    val hasDuplicateKey = expr.schema match {
+      case s: StructType =>
+        s.names.distinct.size != s.names.size ||
+        !s.filter(
+          f =>
+            !s.names
+              .filter(
+                n => n != f.name && n.toLowerCase(Locale.ROOT) == f.name.toLowerCase(Locale.ROOT))
+              .isEmpty)
+          .isEmpty
+      case other =>
+        false
+    }
+    if (hasDuplicateKey) {
+      throw new GlutenNotSupportException(
+        "'from_json' with duplicate keys is not supported in Velox")
+    }
+    val hasCorruptRecord = expr.schema match {
+      case s: StructType =>
+        !s.filter(_.name == SQLConf.get.getConf(SQLConf.COLUMN_NAME_OF_CORRUPT_RECORD)).isEmpty
+      case other =>
+        false
+    }
+    if (hasCorruptRecord) {
+      throw new GlutenNotSupportException(
+        "'from_json' with column corrupt record is not supported in Velox")
+    }
+    GenericExpressionTransformer(substraitExprName, children, expr)
+  }
+
   /** Generate an expression transformer to transform NamedStruct to Substrait. */
   override def genNamedStructTransformer(
       substraitExprName: String,
@@ -738,7 +811,7 @@ class VeloxSparkPlanExecApi extends SparkPlanExecApi {
     // ISOControl characters, refer java.lang.Character.isISOControl(int)
     val isoControlStr = (('\u0000' to '\u001F') ++ ('\u007F' to '\u009F')).toList.mkString
     // scalastyle:on nonascii
-    if (GlutenConfig.get.castFromVarcharAddTrimNode && c.child.dataType == StringType) {
+    if (VeloxConfig.get.castFromVarcharAddTrimNode && c.child.dataType == StringType) {
       val trimStr = c.dataType match {
         case BinaryType | _: ArrayType | _: MapType | _: StructType | _: UserDefinedType[_] =>
           None
@@ -774,13 +847,14 @@ class VeloxSparkPlanExecApi extends SparkPlanExecApi {
       Sig[CollectSet](ExpressionNames.COLLECT_SET),
       Sig[VeloxBloomFilterMightContain](ExpressionNames.MIGHT_CONTAIN),
       Sig[VeloxBloomFilterAggregate](ExpressionNames.BLOOM_FILTER_AGG),
+      Sig[MapFilter](ExpressionNames.MAP_FILTER),
       // For test purpose.
       Sig[VeloxDummyExpression](VeloxDummyExpression.VELOX_DUMMY_EXPRESSION)
     )
   }
 
   override def rewriteSpillPath(path: String): String = {
-    val fs = GlutenConfig.get.veloxSpillFileSystem
+    val fs = VeloxConfig.get.veloxSpillFileSystem
     fs match {
       case "local" =>
         path
@@ -837,4 +911,20 @@ class VeloxSparkPlanExecApi extends SparkPlanExecApi {
       attributeSeq: Seq[Attribute]): ExpressionTransformer = {
     VeloxHiveUDFTransformer.replaceWithExpressionTransformer(expr, attributeSeq)
   }
+
+  override def genColumnarCollectLimitExec(
+      limit: Int,
+      child: SparkPlan): ColumnarCollectLimitBaseExec =
+    ColumnarCollectLimitExec(limit, child)
+
+  override def genColumnarRangeExec(
+      start: Long,
+      end: Long,
+      step: Long,
+      numSlices: Int,
+      numElements: BigInt,
+      outputAttributes: Seq[Attribute],
+      child: Seq[SparkPlan]): ColumnarRangeBaseExec =
+    ColumnarRangeExec(start, end, step, numSlices, numElements, outputAttributes, child)
+
 }

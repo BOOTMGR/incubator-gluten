@@ -16,17 +16,18 @@
  */
 package org.apache.gluten.execution.mergetree
 
-import org.apache.gluten.backendsapi.clickhouse.{CHConf, RuntimeConfig, RuntimeSettings}
+import org.apache.gluten.backendsapi.clickhouse.{CHConfig, RuntimeConfig, RuntimeSettings}
 import org.apache.gluten.config.GlutenConfig
 import org.apache.gluten.execution.{FileSourceScanExecTransformer, GlutenClickHouseTPCHAbstractSuite}
 
 import org.apache.spark.SparkConf
-import org.apache.spark.sql.SaveMode
+import org.apache.spark.sql.{Row, SaveMode}
 import org.apache.spark.sql.delta.catalog.ClickHouseTableV2
 import org.apache.spark.sql.delta.files.TahoeFileIndex
 import org.apache.spark.sql.execution.adaptive.AdaptiveSparkPlanHelper
 import org.apache.spark.sql.execution.datasources.mergetree.StorageMeta
 import org.apache.spark.sql.execution.datasources.v2.clickhouse.metadata.AddMergeTreeParts
+import org.apache.spark.sql.types._
 
 import org.apache.commons.io.FileUtils
 import org.apache.hadoop.conf.Configuration
@@ -51,7 +52,7 @@ class GlutenClickHouseMergeTreeWriteOnHDFSSuite
   }
 
   override protected def sparkConf: SparkConf = {
-    import org.apache.gluten.backendsapi.clickhouse.CHConf._
+    import org.apache.gluten.backendsapi.clickhouse.CHConfig._
 
     super.sparkConf
       .set("spark.shuffle.manager", "org.apache.spark.shuffle.sort.ColumnarShuffleManager")
@@ -61,7 +62,7 @@ class GlutenClickHouseMergeTreeWriteOnHDFSSuite
       .set("spark.sql.adaptive.enabled", "true")
       .set(RuntimeConfig.LOGGER_LEVEL.key, "error")
       .set(GlutenConfig.NATIVE_WRITER_ENABLED.key, "true")
-      .set(CHConf.ENABLE_ONEPIPELINE_MERGETREE_WRITE.key, spark35.toString)
+      .set(CHConfig.ENABLE_ONEPIPELINE_MERGETREE_WRITE.key, spark35.toString)
       .setCHSettings("mergetree.merge_after_insert", false)
   }
 
@@ -359,6 +360,54 @@ class GlutenClickHouseMergeTreeWriteOnHDFSSuite
     spark.sql("drop table lineitem_mergetree_partition_hdfs")
   }
 
+  test("test partition values with escape chars") {
+
+    val schema = StructType(
+      Seq(
+        StructField.apply("id", IntegerType, nullable = true),
+        StructField.apply("escape", StringType, nullable = true)
+      ))
+
+    // scalastyle:off nonascii
+    val data: Seq[Row] = Seq(
+      Row(1, "="),
+      Row(2, "/"),
+      Row(3, "#"),
+      Row(4, ":"),
+      Row(5, "\\"),
+      Row(6, "\u0001"),
+      Row(7, "中文"),
+      Row(8, " "),
+      Row(9, "a b")
+    )
+    // scalastyle:on nonascii
+
+    val df = spark.createDataFrame(spark.sparkContext.parallelize(data), schema)
+    df.createOrReplaceTempView("origin_table")
+
+    // spark.conf.set("spark.gluten.enabled", "false")
+    spark.sql(s"""
+                 |DROP TABLE IF EXISTS partition_escape;
+                 |""".stripMargin)
+
+    spark.sql(s"""
+                 |CREATE TABLE IF NOT EXISTS partition_escape
+                 |(
+                 | c1  int,
+                 | c2  string
+                 |)
+                 |USING clickhouse
+                 |PARTITIONED BY (c2)
+                 |TBLPROPERTIES (storage_policy='__hdfs_main',
+                 |               orderByKey='c1',
+                 |               primaryKey='c1')
+                 |LOCATION '$HDFS_URL/test/partition_escape'
+                 |""".stripMargin)
+
+    spark.sql("insert into partition_escape select * from origin_table")
+    spark.sql("select * from partition_escape").show()
+  }
+
   testSparkVersionLE33("test mergetree write with bucket table") {
     spark.sql(s"""
                  |DROP TABLE IF EXISTS lineitem_mergetree_bucket_hdfs;
@@ -497,8 +546,8 @@ class GlutenClickHouseMergeTreeWriteOnHDFSSuite
 
     withSQLConf(
       "spark.databricks.delta.optimize.minFileSize" -> "200000000",
-      CHConf.runtimeSettings("mergetree.merge_after_insert") -> "true",
-      CHConf.runtimeSettings("mergetree.insert_without_local_storage") -> "true",
+      CHConfig.runtimeSettings("mergetree.merge_after_insert") -> "true",
+      CHConfig.runtimeSettings("mergetree.insert_without_local_storage") -> "true",
       RuntimeSettings.MIN_INSERT_BLOCK_SIZE_ROWS.key -> "10000"
     ) {
       spark.sql(s"""

@@ -18,6 +18,7 @@
 
 #include <Disks/ObjectStorages/CompactObjectStorageDiskTransaction.h>
 #include <Disks/SingleDiskVolume.h>
+#include <Interpreters/ExpressionActions.h>
 #include <Interpreters/MergeTreeTransaction.h>
 #include <Storages/MergeTree/DataPartStorageOnDiskFull.h>
 #include <Storages/MergeTree/MergeTreeSettings.h>
@@ -288,7 +289,8 @@ MergeTreeData::LoadPartResult SparkStorageMergeTree::loadDataPart(
         has_lightweight_delete_parts.store(true);
 
     // without it "test mergetree optimize partitioned by one low card column" will log ERROR
-    calculateColumnAndSecondaryIndexSizesImpl();
+    resetColumnSizes();
+    calculateColumnAndSecondaryIndexSizesIfNeeded();
 
     LOG_TRACE(log, "Finished loading {} part {} on disk {}", magic_enum::enum_name(to_state), part_name, part_disk_ptr->getName());
     return res;
@@ -469,24 +471,22 @@ MergeTreeDataWriter::TemporaryPart SparkMergeTreeDataWriter::writeTempPart(
         new_data_part->uuid = UUIDHelpers::generateV4();
 
     SyncGuardPtr sync_guard;
-    if (new_data_part->isStoredOnDisk())
+
+    /// The name could be non-unique in case of stale files from previous runs.
+    String full_path = new_data_part->getDataPartStorage().getFullPath();
+
+    if (new_data_part->getDataPartStorage().exists())
     {
-        /// The name could be non-unique in case of stale files from previous runs.
-        String full_path = new_data_part->getDataPartStorage().getFullPath();
+        LOG_WARNING(log, "Removing old temporary directory {}", full_path);
+        data_part_storage->removeRecursive();
+    }
 
-        if (new_data_part->getDataPartStorage().exists())
-        {
-            // LOG_WARNING(log, "Removing old temporary directory {}", full_path);
-            data_part_storage->removeRecursive();
-        }
+    data_part_storage->createDirectories();
 
-        data_part_storage->createDirectories();
-
-        if ((*data.getSettings())[MergeTreeSetting::fsync_part_directory])
-        {
-            const auto disk = data_part_volume->getDisk();
-            sync_guard = disk->getDirectorySyncGuard(full_path);
-        }
+    if ((*data.getSettings())[MergeTreeSetting::fsync_part_directory])
+    {
+        const auto disk = data_part_volume->getDisk();
+        sync_guard = disk->getDirectorySyncGuard(full_path);
     }
 
     /// This effectively chooses minimal compression method:

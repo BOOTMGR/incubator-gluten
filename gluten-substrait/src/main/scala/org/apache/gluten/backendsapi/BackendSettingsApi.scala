@@ -29,7 +29,8 @@ import org.apache.spark.sql.connector.read.Scan
 import org.apache.spark.sql.execution.command.CreateDataSourceTableAsSelectCommand
 import org.apache.spark.sql.execution.datasources.{FileFormat, InsertIntoHadoopFsRelationCommand}
 import org.apache.spark.sql.types.StructField
-import org.apache.spark.util.SerializableConfiguration
+
+import org.apache.hadoop.conf.Configuration
 
 trait BackendSettingsApi {
 
@@ -41,7 +42,7 @@ trait BackendSettingsApi {
       fields: Array[StructField],
       rootPaths: Seq[String],
       properties: Map[String, String],
-      serializableHadoopConf: Option[SerializableConfiguration] = None): ValidationResult =
+      hadoopConf: Configuration): ValidationResult =
     ValidationResult.succeeded
 
   def getSubstraitReadFileFormatV1(fileFormat: FileFormat): LocalFilesNode.ReadFileFormat
@@ -52,33 +53,45 @@ trait BackendSettingsApi {
       format: FileFormat,
       fields: Array[StructField],
       bucketSpec: Option[BucketSpec],
+      isPartitionedTable: Boolean,
       options: Map[String, String]): ValidationResult = ValidationResult.succeeded
 
   def supportNativeWrite(fields: Array[StructField]): Boolean = true
-  def supportNativeMetadataColumns(): Boolean = false
-  def supportNativeRowIndexColumn(): Boolean = false
+
+  def supportNativeMetadataColumns(): Boolean = true
+
+  def supportNativeRowIndexColumn(): Boolean = true
 
   def supportExpandExec(): Boolean = false
+
   def supportSortExec(): Boolean = false
+
   def supportSortMergeJoinExec(): Boolean = true
+
   def supportWindowExec(windowFunctions: Seq[NamedExpression]): Boolean = {
     false
   }
+
   def supportWindowGroupLimitExec(rankLikeFunction: Expression): Boolean = {
     false
   }
+
   def supportColumnarShuffleExec(): Boolean = {
     GlutenConfig.get.enableColumnarShuffle
   }
+
   def enableJoinKeysRewrite(): Boolean = true
+
   def supportHashBuildJoinTypeOnLeft: JoinType => Boolean = {
     case _: InnerLike | RightOuter | FullOuter => true
     case _ => false
   }
+
   def supportHashBuildJoinTypeOnRight: JoinType => Boolean = {
     case _: InnerLike | LeftOuter | FullOuter | LeftSemi | LeftAnti | _: ExistenceJoin => true
     case _ => false
   }
+
   def supportStructType(): Boolean = false
 
   def structFieldToLowerCase(): Boolean = true
@@ -89,6 +102,7 @@ trait BackendSettingsApi {
   def recreateJoinExecOnFallback(): Boolean = false
 
   def excludeScanExecFromCollapsedStage(): Boolean = false
+
   def rescaleDecimalArithmetic: Boolean = false
 
   def allowDecimalArithmetic: Boolean = true
@@ -132,11 +146,16 @@ trait BackendSettingsApi {
 
   def supportCartesianProductExecWithCondition(): Boolean = true
 
-  def supportBroadcastNestedLoopJoinExec(): Boolean = true
-
   def supportSampleExec(): Boolean = false
 
   def supportColumnarArrowUdf(): Boolean = false
 
   def needPreComputeRangeFrameBoundary(): Boolean = false
+
+  def supportCollectLimitExec(): Boolean = false
+
+  def broadcastNestedLoopJoinSupportsFullOuterJoin(): Boolean = false
+
+  def supportIcebergEqualityDeleteRead(): Boolean = true
+
 }

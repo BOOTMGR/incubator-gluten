@@ -27,7 +27,7 @@ import org.apache.gluten.extension.columnar.heuristic.HeuristicTransform
 import org.apache.gluten.sql.shims.SparkShimLoader
 import org.apache.gluten.substrait.expression.{ExpressionBuilder, ExpressionNode, WindowFunctionNode}
 import org.apache.gluten.utils.{CHJoinValidateUtil, UnknownJoinStrategy}
-import org.apache.gluten.vectorized.CHColumnarBatchSerializer
+import org.apache.gluten.vectorized.{BlockOutputStream, CHColumnarBatchSerializer, CHNativeBlock, CHStreamReader}
 
 import org.apache.spark.ShuffleDependency
 import org.apache.spark.internal.Logging
@@ -58,6 +58,7 @@ import org.apache.spark.sql.vectorized.ColumnarBatch
 
 import org.apache.commons.lang3.ClassUtils
 
+import java.io.{ObjectInputStream, ObjectOutputStream}
 import java.lang.{Long => JLong}
 import java.util.{ArrayList => JArrayList, List => JList, Map => JMap}
 
@@ -315,7 +316,8 @@ class CHSparkPlanExecApi extends SparkPlanExecApi with Logging {
       condition,
       left,
       right,
-      isSkewJoin)
+      isSkewJoin,
+      false)
   }
 
   /** Generate BroadcastHashJoinExecTransformer. */
@@ -452,6 +454,7 @@ class CHSparkPlanExecApi extends SparkPlanExecApi with Logging {
     val readBatchNumRows = metrics("avgReadBatchNumRows")
     val numOutputRows = metrics("numOutputRows")
     val dataSize = metrics("dataSize")
+    val deserializationTime = metrics("deserializeTime")
     if (GlutenConfig.get.isUseCelebornShuffleManager) {
       val clazz = ClassUtils.getClass("org.apache.spark.shuffle.CHCelebornColumnarBatchSerializer")
       val constructor =
@@ -460,7 +463,7 @@ class CHSparkPlanExecApi extends SparkPlanExecApi with Logging {
     } else if (GlutenConfig.get.isUseUniffleShuffleManager) {
       throw new UnsupportedOperationException("temporarily uniffle not support ch ")
     } else {
-      new CHColumnarBatchSerializer(readBatchNumRows, numOutputRows, dataSize)
+      new CHColumnarBatchSerializer(readBatchNumRows, numOutputRows, dataSize, deserializationTime)
     }
   }
 
@@ -523,6 +526,8 @@ class CHSparkPlanExecApi extends SparkPlanExecApi with Logging {
             wrapChild(union)
           case ordered: TakeOrderedAndProjectExecTransformer =>
             wrapChild(ordered)
+          case rddScan: CHRDDScanTransformer =>
+            wrapChild(rddScan)
           case other =>
             throw new GlutenNotSupportException(
               s"Not supported operator ${other.nodeName} for BroadcastRelation")
@@ -580,9 +585,11 @@ class CHSparkPlanExecApi extends SparkPlanExecApi with Logging {
     List(
       Sig[CollectList](ExpressionNames.COLLECT_LIST),
       Sig[CollectSet](ExpressionNames.COLLECT_SET),
-      Sig[MonotonicallyIncreasingID](MONOTONICALLY_INCREASING_ID)
+      Sig[MonotonicallyIncreasingID](MONOTONICALLY_INCREASING_ID),
+      CHFlattenedExpression.sigAnd,
+      CHFlattenedExpression.sigOr
     ) ++
-      ExpressionExtensionTrait.expressionExtensionTransformer.expressionSigList ++
+      ExpressionExtensionTrait.expressionExtensionSigList ++
       SparkShimLoader.getSparkShims.bloomFilterExpressionMappings()
   }
 
@@ -591,12 +598,12 @@ class CHSparkPlanExecApi extends SparkPlanExecApi with Logging {
       substraitExprName: String,
       expr: Expression,
       attributeSeq: Seq[Attribute]): Option[ExpressionTransformer] = expr match {
-    case e
-        if ExpressionExtensionTrait.expressionExtensionTransformer.extensionExpressionsMapping
-          .contains(e.getClass) =>
+    case e if ExpressionExtensionTrait.findExpressionExtension(e.getClass).nonEmpty =>
       // Use extended expression transformer to replace custom expression first
       Some(
-        ExpressionExtensionTrait.expressionExtensionTransformer
+        ExpressionExtensionTrait
+          .findExpressionExtension(e.getClass)
+          .get
           .replaceWithExtensionExpressionTransformer(substraitExprName, e, attributeSeq))
     case _ => None
   }
@@ -888,7 +895,7 @@ class CHSparkPlanExecApi extends SparkPlanExecApi with Logging {
       argument: ExpressionTransformer,
       function: ExpressionTransformer,
       expr: ArraySort): ExpressionTransformer = {
-    GenericExpressionTransformer(substraitExprName, Seq(argument, function), expr)
+    CHArraySortTransformer(substraitExprName, argument, function, expr)
   }
 
   override def genDateAddTransformer(
@@ -931,4 +938,59 @@ class CHSparkPlanExecApi extends SparkPlanExecApi with Logging {
       limitExpr: ExpressionTransformer,
       original: StringSplit): ExpressionTransformer =
     CHStringSplitTransformer(substraitExprName, Seq(srcExpr, regexExpr, limitExpr), original)
+
+  override def genColumnarCollectLimitExec(
+      limit: Int,
+      child: SparkPlan): ColumnarCollectLimitBaseExec =
+    throw new GlutenNotSupportException("ColumnarCollectLimit is not supported in ch backend.")
+
+  override def genColumnarRangeExec(
+      start: Long,
+      end: Long,
+      step: Long,
+      numSlices: Int,
+      numElements: BigInt,
+      outputAttributes: Seq[Attribute],
+      child: Seq[SparkPlan]): ColumnarRangeBaseExec =
+    CHRangeExecTransformer(start, end, step, numSlices, numElements, outputAttributes, child)
+
+  override def expressionFlattenSupported(expr: Expression): Boolean = expr match {
+    case ca: FlattenedAnd => CHFlattenedExpression.supported(ca.name)
+    case co: FlattenedOr => CHFlattenedExpression.supported(co.name)
+    case _ => false
+  }
+
+  override def genFlattenedExpressionTransformer(
+      substraitName: String,
+      children: Seq[ExpressionTransformer],
+      expr: Expression): ExpressionTransformer = expr match {
+    case ce: FlattenedAnd => GenericExpressionTransformer(ce.name, children, ce)
+    case co: FlattenedOr => GenericExpressionTransformer(co.name, children, co)
+    case _ => super.genFlattenedExpressionTransformer(substraitName, children, expr)
+  }
+
+  override def isSupportRDDScanExec(plan: RDDScanExec): Boolean = true
+
+  override def getRDDScanTransform(plan: RDDScanExec): RDDScanTransformer =
+    CHRDDScanTransformer.replace(plan)
+
+  override def copyColumnarBatch(batch: ColumnarBatch): ColumnarBatch =
+    CHNativeBlock.fromColumnarBatch(batch).copyColumnarBatch()
+
+  override def serializeColumnarBatch(output: ObjectOutputStream, batch: ColumnarBatch): Unit = {
+    val writeBuffer: Array[Byte] =
+      new Array[Byte](CHBackendSettings.customizeBufferSize)
+    BlockOutputStream.directWrite(
+      output,
+      writeBuffer,
+      CHBackendSettings.customizeBufferSize,
+      CHNativeBlock.fromColumnarBatch(batch).blockAddress())
+  }
+
+  override def deserializeColumnarBatch(input: ObjectInputStream): ColumnarBatch = {
+    val bufferSize = CHBackendSettings.customizeBufferSize
+    val readBuffer: Array[Byte] = new Array[Byte](bufferSize)
+    val address = CHStreamReader.directRead(input, readBuffer, bufferSize)
+    new CHNativeBlock(address).toColumnarBatch
+  }
 }

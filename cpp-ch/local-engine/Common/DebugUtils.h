@@ -17,6 +17,7 @@
 #pragma once
 
 #include <Core/Block.h>
+#include <Common/Logger.h>
 
 namespace google::protobuf
 {
@@ -25,6 +26,7 @@ class Message;
 namespace DB
 {
 class QueryPlan;
+class ActionsDAG;
 }
 namespace debug
 {
@@ -37,9 +39,11 @@ void headBlock(const DB::Block & block, size_t count = 10);
 void headColumn(const DB::ColumnPtr & column, size_t count = 10);
 void printBlockHeader(const DB::Block & block, const std::string & prefix = "");
 std::string showString(const DB::Block & block, size_t numRows = 20, size_t truncate = 20, bool vertical = false);
+std::string showString(const DB::ColumnPtr & column, size_t numRows = 20, size_t truncate = 20, bool vertical = false);
 inline std::string verticalShowString(const DB::Block & block, size_t numRows = 20, size_t truncate = 20)
 {
     return showString(block, numRows, truncate, true);
 }
+std::string dumpActionsDAG(const DB::ActionsDAG & dag);
 
 }

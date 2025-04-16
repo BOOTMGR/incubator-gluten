@@ -17,15 +17,13 @@
 
 #pragma once
 
-#include "operators/serializer/VeloxColumnarBatchSerializer.h"
 #include "shuffle/Payload.h"
 #include "shuffle/ShuffleReader.h"
 #include "shuffle/VeloxSortShuffleWriter.h"
-#include "utils/Timer.h"
+
+#include "velox/serializers/PrestoSerializer.h"
 #include "velox/type/Type.h"
 #include "velox/vector/ComplexVector.h"
-
-#include <velox/serializers/PrestoSerializer.h>
 
 namespace gluten {
 
@@ -132,11 +130,12 @@ class VeloxRssSortShuffleReaderDeserializer : public ColumnarBatchIterator {
   facebook::velox::serializer::presto::PrestoVectorSerde::PrestoOptions serdeOptions_;
   int64_t& deserializeTime_;
   std::shared_ptr<VeloxInputStream> in_;
+  std::shared_ptr<arrow::io::InputStream> arrowIn_;
 };
 
-class VeloxColumnarBatchDeserializerFactory : public DeserializerFactory {
+class VeloxShuffleReaderDeserializerFactory {
  public:
-  VeloxColumnarBatchDeserializerFactory(
+  VeloxShuffleReaderDeserializerFactory(
       const std::shared_ptr<arrow::Schema>& schema,
       const std::shared_ptr<arrow::util::Codec>& codec,
       const facebook::velox::common::CompressionKind veloxCompressionType,
@@ -147,15 +146,13 @@ class VeloxColumnarBatchDeserializerFactory : public DeserializerFactory {
       std::shared_ptr<facebook::velox::memory::MemoryPool> veloxPool,
       ShuffleWriterType shuffleWriterType);
 
-  std::unique_ptr<ColumnarBatchIterator> createDeserializer(std::shared_ptr<arrow::io::InputStream> in) override;
+  std::unique_ptr<ColumnarBatchIterator> createDeserializer(std::shared_ptr<arrow::io::InputStream> in);
 
-  arrow::MemoryPool* getPool() override;
+  arrow::MemoryPool* getPool();
 
-  int64_t getDecompressTime() override;
+  int64_t getDecompressTime();
 
-  int64_t getDeserializeTime() override;
-
-  ShuffleWriterType getShuffleWriterType() override;
+  int64_t getDeserializeTime();
 
  private:
   void initFromSchema();
@@ -180,6 +177,17 @@ class VeloxColumnarBatchDeserializerFactory : public DeserializerFactory {
 
 class VeloxShuffleReader final : public ShuffleReader {
  public:
-  VeloxShuffleReader(std::unique_ptr<DeserializerFactory> factory);
+  VeloxShuffleReader(std::unique_ptr<VeloxShuffleReaderDeserializerFactory> factory);
+
+  std::shared_ptr<ResultIterator> readStream(std::shared_ptr<arrow::io::InputStream> in) override;
+
+  int64_t getDecompressTime() const override;
+
+  int64_t getDeserializeTime() const override;
+
+  arrow::MemoryPool* getPool() const override;
+
+ private:
+  std::unique_ptr<VeloxShuffleReaderDeserializerFactory> factory_;
 };
 } // namespace gluten
