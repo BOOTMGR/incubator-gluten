@@ -48,6 +48,8 @@ object ExpressionNames {
   final val APPROX_DISTINCT = "approx_distinct"
   final val APPROX_PERCENTILE = "approx_percentile"
   final val APPROX_COUNT_DISTINCT = "approx_count_distinct"
+  final val APPROX_SET = "approx_set"
+  final val CARDINALITY = "cardinality"
   final val PERCENTILE = "percentile"
   final val SKEWNESS = "skewness"
   final val KURTOSIS = "kurtosis"

@@ -17,11 +17,11 @@
 package org.apache.gluten.extension
 
 import org.apache.gluten.config.GlutenConfig
-import org.apache.gluten.expression.aggregate.HLLAdapter
+import org.apache.gluten.expression.aggregate.{HLLAdapter, HLLSketchAdapter, HllSketchEstimateAdapter}
 
 import org.apache.spark.sql.SparkSession
-import org.apache.spark.sql.catalyst.expressions.Literal
-import org.apache.spark.sql.catalyst.expressions.aggregate.{AggregateExpression, HyperLogLogPlusPlus}
+import org.apache.spark.sql.catalyst.expressions.{HllSketchEstimate, Literal}
+import org.apache.spark.sql.catalyst.expressions.aggregate.{AggregateExpression, HllSketchAgg, HyperLogLogPlusPlus}
 import org.apache.spark.sql.catalyst.plans.logical.{Aggregate, LogicalPlan}
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.catalyst.trees.TreePattern.{AGGREGATE, AGGREGATE_EXPRESSION}
@@ -43,6 +43,23 @@ case class HLLRewriteRule(spark: SparkSession) extends Rule[LogicalPlan] {
               hll.inputAggBufferOffset)
 
             aggExpr.copy(aggregateFunction = hllAdapter)
+
+          case aggExpr @ AggregateExpression(hll: HllSketchAgg, _, _, _, _)
+              if GlutenConfig.get.enableNativeHyperLogLogAggregateFunction &&
+                GlutenConfig.get.enableColumnarHashAgg &&
+                isSupportedDataType(hll.left.dataType) =>
+            val hllAdapter = HLLSketchAdapter(
+              hll.left,
+              Literal(0.05D),
+              hll.mutableAggBufferOffset,
+              hll.inputAggBufferOffset)
+
+            aggExpr.copy(aggregateFunction = hllAdapter)
+
+          case estimateExpr @ HllSketchEstimate(child)
+            if GlutenConfig.get.enableNativeHyperLogLogAggregateFunction &&
+              GlutenConfig.get.enableColumnarHashAgg =>
+            HllSketchEstimateAdapter(child)
         }
     }
   }

@@ -82,6 +82,7 @@ void registerFunctionOverwrite() {
 
 void registerAllFunctions() {
   velox::functions::sparksql::registerFunctions("");
+  velox::functions::prestosql::registerHyperLogFunctions("");
   velox::aggregate::prestosql::registerAllAggregateFunctions(
       "", true /*registerCompanionFunctions*/, false /*onlyPrestoSignatures*/, true /*overwrite*/);
   velox::functions::aggregate::sparksql::registerAggregateFunctions(

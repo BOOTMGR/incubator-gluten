@@ -16,9 +16,13 @@
  */
 package org.apache.gluten.expression.aggregate
 
+import org.apache.datasketches.hll.HllSketch
+import org.apache.datasketches.memory.Memory
+import org.apache.spark.sql.AnalysisException
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.expressions.aggregate.{HyperLogLogPlusPlus, ImperativeAggregate, TypedImperativeAggregate}
+import org.apache.spark.sql.catalyst.expressions.codegen.CodegenFallback
 import org.apache.spark.sql.catalyst.trees.BinaryLike
 import org.apache.spark.sql.catalyst.util.HyperLogLogPlusPlusHelper
 import org.apache.spark.sql.types._
@@ -113,4 +117,132 @@ case class HLLAdapter(
       newLeft: Expression,
       newRight: Expression): HLLAdapter =
     this.copy(child = newLeft, relativeSDExpr = newRight)
+}
+
+case class HLLSketchAdapter(
+                       child: Expression,
+                       relativeSDExpr: Expression,
+                       mutableAggBufferOffset: Int = 0,
+                       inputAggBufferOffset: Int = 0)
+  extends TypedImperativeAggregate[GenericInternalRow]
+    with BinaryLike[Expression] {
+
+  def this(child: Expression, relativeSDExpr: Expression) = {
+    this(
+      child = child,
+      relativeSDExpr = relativeSDExpr,
+      mutableAggBufferOffset = 0,
+      inputAggBufferOffset = 0)
+  }
+
+  private lazy val relativeSD = HLLAdapter.validateIntegerLiteral(relativeSDExpr)
+
+  private lazy val hllppHelper = new HyperLogLogPlusPlusHelper(0.05)
+
+  private lazy val aggBufferDataType: Array[DataType] = {
+    Seq.tabulate(hllppHelper.numWords)(i => BinaryType).toArray
+  }
+
+  private lazy val projection = UnsafeProjection.create(aggBufferDataType)
+
+  private lazy val row = new UnsafeRow(hllppHelper.numWords)
+
+  override def prettyName: String = "velox_approx_set"
+
+  override def withNewMutableAggBufferOffset(newMutableAggBufferOffset: Int): ImperativeAggregate =
+    copy(mutableAggBufferOffset = newMutableAggBufferOffset)
+
+  override def withNewInputAggBufferOffset(newInputAggBufferOffset: Int): ImperativeAggregate =
+    copy(inputAggBufferOffset = newInputAggBufferOffset)
+
+  override def nullable: Boolean = false
+
+  override def dataType: DataType = BinaryType
+
+  override def defaultResult: Option[Literal] = Option(Literal.create(0L, dataType))
+
+  override def createAggregationBuffer(): GenericInternalRow = {
+    val res = new GenericInternalRow(hllppHelper.numWords)
+    for (i <- 0 until hllppHelper.numWords) {
+      res.update(i, 0L)
+    }
+    res
+  }
+
+  override def eval(buffer: GenericInternalRow): Any = {
+    hllppHelper.query(buffer, 0)
+  }
+
+  override def update(buffer: GenericInternalRow, input: InternalRow): GenericInternalRow = {
+    val v = child.eval(input)
+    if (v != null) {
+      hllppHelper.update(buffer, 0, v, child.dataType)
+    }
+    buffer
+  }
+
+  override def merge(buffer: GenericInternalRow, other: GenericInternalRow): GenericInternalRow = {
+    hllppHelper.merge(buffer1 = buffer, buffer2 = other, offset1 = 0, offset2 = 0)
+    buffer
+  }
+
+  override def serialize(obj: GenericInternalRow): Array[Byte] = {
+    projection.apply(obj).getBytes()
+  }
+
+  override def deserialize(bytes: Array[Byte]): GenericInternalRow = {
+    val data = createAggregationBuffer()
+    row.pointTo(bytes, bytes.length)
+    for (i <- 0 until hllppHelper.numWords) {
+      data.update(i, row.getLong(i))
+    }
+    data
+  }
+
+  override def left: Expression = child
+
+  override def right: Expression = relativeSDExpr
+
+  override protected def withNewChildrenInternal(
+                                                  newLeft: Expression,
+                                                  newRight: Expression): HLLSketchAdapter =
+    this.copy(child = newLeft, relativeSDExpr = newRight)
+}
+
+case class HllSketchEstimateAdapter(child: Expression)
+  extends UnaryExpression
+    with CodegenFallback
+    with ExpectsInputTypes
+    with NullIntolerant {
+
+  override protected def withNewChildInternal(newChild: Expression): HllSketchEstimateAdapter =
+    copy(child = newChild)
+
+  override def prettyName: String = "velox_cardinality"
+
+  override def inputTypes: Seq[BinaryType] = Seq(BinaryType)
+
+  override def dataType: DataType = LongType
+
+  override def nullSafeEval(input: Any): Any = {
+    val buffer = input.asInstanceOf[Array[Byte]]
+    try {
+      Math.round(HllSketch.heapify(Memory.wrap(buffer)).getEstimate)
+    } catch {
+      case _: java.lang.Error =>
+//        throw QueryExecutionErrors.hllInvalidInputSketchBuffer(prettyName)
+        throw new IllegalStateException(prettyName + " invalid sketch buffer")
+    }
+  }
+}
+
+object HLLAdapter {
+  def validateIntegerLiteral(exp: Expression): Int = exp match {
+    case Literal(d: Int, IntegerType) => d
+    case Literal(dec: Decimal, _) => dec.toInt
+    case _ =>
+      throw new AnalysisException(
+        errorClass = "_LEGACY_ERROR_TEMP_1104",
+        messageParameters = Map.empty)
+  }
 }
