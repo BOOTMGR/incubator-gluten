@@ -17,7 +17,7 @@
 set -exu
 
 VELOX_REPO=https://github.com/BOOTMGR/velox.git
-VELOX_BRANCH=spark-3.2.1
+VELOX_BRANCH=spark-3.2.1-upstream
 VELOX_HOME=""
 
 OS=`uname -s`
